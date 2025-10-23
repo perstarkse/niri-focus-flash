@@ -249,6 +249,25 @@ layout {
         color "#0007"
     }
 
+    // Enable focus opacity for windows.
+    // This will make focused windows more opaque and unfocused windows more transparent.
+    focus-opacity {
+        // Uncomment this line to enable focus opacity.
+        // on
+
+        // Opacity of the focused window (0.0 to 1.0).
+        active-opacity 1.0
+
+        // Opacity of unfocused windows (0.0 to 1.0).
+        inactive-opacity 0.8
+
+        // Animation duration in milliseconds.
+        animation-duration-ms 150
+
+        // Disable focus opacity when there's only one window to prevent flashing.
+        disable-on-solo true
+    }
+
     // Struts shrink the area occupied by windows, similarly to layer-shell panels.
     // You can think of them as a kind of outer gaps. They are set in logical pixels.
     // Left and right struts will cause the next window to the side to always be visible.

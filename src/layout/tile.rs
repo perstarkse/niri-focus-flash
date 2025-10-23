@@ -2,7 +2,7 @@ use core::f64;
 use std::rc::Rc;
 
 use niri_config::utils::MergeWith as _;
-use niri_config::{Color, CornerRadius, GradientInterpolation};
+use niri_config::{Color, CornerRadius, FocusOpacity, GradientInterpolation};
 use niri_ipc::WindowLayout;
 use smithay::backend::renderer::element::{Element, Kind};
 use smithay::backend::renderer::gles::GlesRenderer;
@@ -91,6 +91,12 @@ pub struct Tile<W: LayoutElement> {
 
     /// The animation of the tile's opacity.
     pub(super) alpha_animation: Option<AlphaAnimation>,
+
+    /// The target focus opacity value for this tile.
+    pub(super) focus_opacity_target: Option<f32>,
+
+    /// Whether the window was focused during the last render update.
+    pub(super) was_focused: bool,
 
     /// Offset during the initial interactive move rubberband.
     pub(super) interactive_move_offset: Point<f64, Logical>,
@@ -200,6 +206,8 @@ impl<W: LayoutElement> Tile<W> {
             move_x_animation: None,
             move_y_animation: None,
             alpha_animation: None,
+            focus_opacity_target: None,
+            was_focused: false,
             interactive_move_offset: Point::from((0., 0.)),
             unmap_snapshot: None,
             rounded_corner_damage: Default::default(),
@@ -639,6 +647,59 @@ impl<W: LayoutElement> Tile<W> {
         }
     }
 
+    pub fn update_focus_opacity(&mut self, focus_config: &FocusOpacity, is_solo_window: bool, is_focused: bool) {
+        // If focus opacity is disabled, ensure no animation and return
+        if !focus_config.enabled || (is_solo_window && focus_config.disable_on_solo) {
+            self.focus_opacity_target = None;
+            if let Some(target) = self.focus_opacity_target.take() {
+                // Animate back to fully opaque if we had focus opacity active
+                if self.alpha_animation.as_ref().map_or(false, |alpha| alpha.anim.to() != 1.0) {
+                    let focus_anim = niri_config::Animation {
+                        off: false,
+                        kind: niri_config::animations::Kind::Easing(niri_config::animations::EasingParams {
+                            duration_ms: focus_config.animation_duration as u32,
+                            curve: niri_config::animations::Curve::EaseOutQuad,
+                        }),
+                    };
+                    self.animate_alpha(target as f64, 1.0, focus_anim);
+                }
+            }
+            return;
+        }
+
+        let target_opacity = if is_focused {
+            focus_config.active_opacity
+        } else {
+            focus_config.inactive_opacity
+        };
+
+        self.focus_opacity_target = Some(target_opacity);
+
+        // If focus state changed, start animation
+        if is_focused != self.was_focused || self.alpha_animation.is_none() {
+            let current_alpha = self
+                .alpha_animation
+                .as_ref()
+                .map_or(1.0, |alpha| alpha.anim.value() as f32);
+
+            let focus_anim = niri_config::animations::Animation {
+                off: false,
+                kind: niri_config::animations::Kind::Easing(niri_config::animations::EasingParams {
+                    duration_ms: focus_config.animation_duration as u32,
+                    curve: niri_config::animations::Curve::EaseOutQuad,
+                }),
+            };
+
+            self.animate_alpha(
+                current_alpha as f64,
+                target_opacity as f64,
+                focus_anim,
+            );
+        }
+
+        self.was_focused = is_focused;
+    }
+
     pub fn window(&self) -> &W {
         &self.window
     }
@@ -1009,7 +1070,7 @@ impl<W: LayoutElement> Tile<W> {
         let fullscreen_progress = self.fullscreen_progress();
         let expanded_progress = self.expanded_progress();
 
-        let win_alpha = if self.window.is_ignoring_opacity_window_rule() {
+        let mut win_alpha = if self.window.is_ignoring_opacity_window_rule() {
             1.
         } else {
             let alpha = self.window.rules().opacity.unwrap_or(1.).clamp(0., 1.);
@@ -1018,6 +1079,11 @@ impl<W: LayoutElement> Tile<W> {
             let p = fullscreen_progress as f32;
             alpha * (1. - p) + 1. * p
         };
+
+        // Apply focus opacity if animation is active
+        if let Some(focus_alpha) = self.focus_opacity_target {
+            win_alpha *= focus_alpha;
+        }
 
         // This is here rather than in render_offset() because render_offset() is currently assumed
         // by the code to be temporary. So, for example, interactive move will try to "grab" the
@@ -1277,6 +1343,10 @@ impl<W: LayoutElement> Tile<W> {
         let elem = (expanded_progress < 1.)
             .then(|| self.shadow.render(renderer, location).map(Into::into));
         rv.chain(elem.into_iter().flatten())
+    }
+
+    pub fn update_focus_opacity_if_enabled(&mut self, focus_config: &FocusOpacity, is_focused: bool, is_solo_window: bool) {
+        self.update_focus_opacity(focus_config, is_solo_window, is_focused);
     }
 
     pub fn render<'a, R: NiriRenderer + 'a>(

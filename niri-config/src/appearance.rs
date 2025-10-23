@@ -674,6 +674,66 @@ pub struct TabIndicatorRule {
     pub urgent_gradient: Option<Gradient>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct FocusOpacity {
+    pub enabled: bool,
+    pub active_opacity: f32,
+    pub inactive_opacity: f32,
+    pub animation_duration: f64,
+    pub disable_on_solo: bool,
+}
+
+impl Default for FocusOpacity {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            active_opacity: 1.0,
+            inactive_opacity: 0.8,
+            animation_duration: 150.0,
+            disable_on_solo: true,
+        }
+    }
+}
+
+// INVESTIGATE merge! macro
+impl MergeWith<FocusOpacityPart> for FocusOpacity {
+    fn merge_with(&mut self, part: &FocusOpacityPart) {
+        self.enabled |= part.on;
+        if part.off {
+            self.enabled = false;
+        }
+
+        if let Some(active_opacity) = part.active_opacity {
+            self.active_opacity = active_opacity.0 as f32;
+        }
+        if let Some(inactive_opacity) = part.inactive_opacity {
+            self.inactive_opacity = inactive_opacity.0 as f32;
+        }
+        if let Some(animation_duration_ms) = part.animation_duration_ms {
+            self.animation_duration = animation_duration_ms.0 as f64;
+        }
+        if let Some(disable_on_solo) = part.disable_on_solo {
+            self.disable_on_solo = disable_on_solo.0;
+        }
+    }
+}
+
+#[derive(knuffel::Decode, Debug, Default, Clone, Copy, PartialEq)]
+pub struct FocusOpacityPart {
+    #[knuffel(child)]
+    pub off: bool,
+    #[knuffel(child)]
+    pub on: bool,
+    #[knuffel(child, unwrap(argument))]
+    pub active_opacity: Option<FloatOrInt<0, 1000>>,
+    #[knuffel(child, unwrap(argument))]
+    pub inactive_opacity: Option<FloatOrInt<0, 1000>>,
+    #[knuffel(child, unwrap(argument))]
+    pub animation_duration_ms: Option<FloatOrInt<0, { i32::MAX }>>,
+    #[knuffel(child)]
+    pub disable_on_solo: Option<Flag>,
+}
+
 impl MergeWith<Self> for BorderRule {
     fn merge_with(&mut self, part: &Self) {
         merge_on_off!((self, part));
@@ -1245,5 +1305,85 @@ mod tests {
         )
         "
         );
+    }
+
+    #[test]
+    fn test_focus_opacity_default_values() {
+        let config = Config::parse_mem(
+            r##"
+            layout {
+                focus-opacity {
+                    on
+                }
+            }
+            "##,
+        )
+        .unwrap();
+
+        let focus_opacity = &config.layout.focus_opacity;
+        assert!(focus_opacity.enabled);
+        assert_eq!(focus_opacity.active_opacity, 1.0);
+        assert_eq!(focus_opacity.inactive_opacity, 0.8);
+        assert_eq!(focus_opacity.animation_duration, 150.0);
+        assert!(focus_opacity.disable_on_solo);
+    }
+
+    #[test]
+    fn test_focus_opacity_custom_values() {
+        let config = Config::parse_mem(
+            r##"
+            layout {
+                focus-opacity {
+                    on
+                    active-opacity 0.9
+                    inactive-opacity 0.6
+                    animation-duration-ms 200
+                    disable-on-solo false
+                }
+            }
+            "##,
+        )
+        .unwrap();
+
+        let focus_opacity = &config.layout.focus_opacity;
+        assert!(focus_opacity.enabled);
+        assert_eq!(focus_opacity.active_opacity, 0.9);
+        assert_eq!(focus_opacity.inactive_opacity, 0.6);
+        assert_eq!(focus_opacity.animation_duration, 200.0);
+        assert!(!focus_opacity.disable_on_solo);
+    }
+
+    #[test]
+    fn test_focus_opacity_disabled() {
+        let config = Config::parse_mem(
+            r##"
+            layout {
+                focus-opacity {
+                    off
+                }
+            }
+            "##,
+        )
+        .unwrap();
+
+        let focus_opacity = &config.layout.focus_opacity;
+        assert!(!focus_opacity.enabled);
+        // Default values should still be present even when disabled
+        assert_eq!(focus_opacity.active_opacity, 1.0);
+        assert_eq!(focus_opacity.inactive_opacity, 0.8);
+        assert_eq!(focus_opacity.animation_duration, 150.0);
+        assert!(focus_opacity.disable_on_solo);
+    }
+
+    #[test]
+    fn test_focus_opacity_disabled_by_default() {
+        let config = Config::parse_mem("").unwrap();
+
+        let focus_opacity = &config.layout.focus_opacity;
+        assert!(!focus_opacity.enabled);
+        assert_eq!(focus_opacity.active_opacity, 1.0);
+        assert_eq!(focus_opacity.inactive_opacity, 0.8);
+        assert_eq!(focus_opacity.animation_duration, 150.0);
+        assert!(focus_opacity.disable_on_solo);
     }
 }
