@@ -1645,6 +1645,18 @@ mod tests {
                         ),
                     },
                 ),
+                focus_flash: FocusFlashAnim {
+                    anim: Animation {
+                        off: true,
+                        kind: Easing(
+                            EasingParams {
+                                duration_ms: 150,
+                                curve: EaseOutQuad,
+                            },
+                        ),
+                    },
+                    min_opacity: 0.75,
+                },
             },
             blur: Blur {
                 off: false,
@@ -2472,6 +2484,129 @@ mod tests {
         -                0.6666666666666666,
         +                0.66667,
         "#,
+        );
+    }
+
+    #[test]
+    fn parse_focus_flash_enables_when_present() {
+        let parsed = do_parse(
+            r#"
+            animations {
+                focus-flash {
+                    min-opacity 0.5
+                    duration-ms 200
+                    curve "ease-out-cubic"
+                }
+            }
+            "#,
+        );
+        assert!(!parsed.animations.focus_flash.anim.off);
+        assert_eq!(parsed.animations.focus_flash.min_opacity, 0.5);
+    }
+
+    #[test]
+    fn parse_focus_flash_off_by_default() {
+        let parsed = do_parse("");
+        assert!(parsed.animations.focus_flash.anim.off);
+        assert_eq!(parsed.animations.focus_flash.min_opacity, 0.75);
+    }
+
+    #[test]
+    fn parse_focus_flash_empty_block_enables_defaults() {
+        use crate::animations::{Curve, EasingParams, Kind};
+
+        let parsed = do_parse(
+            r#"
+            animations {
+                focus-flash {}
+            }
+            "#,
+        );
+        assert!(!parsed.animations.focus_flash.anim.off);
+        assert_eq!(parsed.animations.focus_flash.min_opacity, 0.75);
+        assert_eq!(
+            parsed.animations.focus_flash.anim.kind,
+            Kind::Easing(EasingParams {
+                duration_ms: 150,
+                curve: Curve::EaseOutQuad,
+            })
+        );
+    }
+
+    #[test]
+    fn parse_focus_flash_explicit_off() {
+        let parsed = do_parse(
+            r#"
+            animations {
+                focus-flash {
+                    off
+                    min-opacity 0.25
+                }
+            }
+            "#,
+        );
+        assert!(parsed.animations.focus_flash.anim.off);
+        assert_eq!(parsed.animations.focus_flash.min_opacity, 0.25);
+    }
+
+    #[test]
+    fn parse_focus_flash_boundary_min_opacities() {
+        let zero = do_parse(
+            r#"
+            animations {
+                focus-flash {
+                    min-opacity 0.0
+                }
+            }
+            "#,
+        );
+        assert_eq!(zero.animations.focus_flash.min_opacity, 0.0);
+
+        let one = do_parse(
+            r#"
+            animations {
+                focus-flash {
+                    min-opacity 1.0
+                }
+            }
+            "#,
+        );
+        assert_eq!(one.animations.focus_flash.min_opacity, 1.0);
+    }
+
+    #[test]
+    fn parse_focus_flash_rejects_spring() {
+        let err = Config::parse_mem(
+            r#"
+            animations {
+                focus-flash {
+                    spring damping-ratio=1.0 stiffness=800 epsilon=0.001
+                }
+            }
+            "#,
+        );
+        assert!(err.is_err(), "focus-flash must reject spring");
+    }
+
+    #[test]
+    fn parse_focus_flash_allows_unit_duration() {
+        // duration-ms 1 floors to 0ms per phase after split; still valid config (instant flash).
+        let parsed = do_parse(
+            r#"
+            animations {
+                focus-flash {
+                    duration-ms 1
+                }
+            }
+            "#,
+        );
+        assert!(!parsed.animations.focus_flash.anim.off);
+        assert_eq!(
+            parsed.animations.focus_flash.anim.kind,
+            crate::animations::Kind::Easing(crate::animations::EasingParams {
+                duration_ms: 1,
+                curve: crate::animations::Curve::EaseOutQuad,
+            })
         );
     }
 }

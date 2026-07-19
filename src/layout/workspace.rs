@@ -1991,6 +1991,8 @@ impl<W: LayoutElement> Workspace<W> {
     pub fn verify_invariants(&self, move_win_id: Option<&W::Id>) {
         use approx::assert_abs_diff_eq;
 
+        use super::tile::AlphaAnimationKind;
+
         let scale = self.scale.fractional_scale();
         assert!(scale > 0.);
         assert!(scale.is_finite());
@@ -2050,13 +2052,31 @@ impl<W: LayoutElement> Workspace<W> {
             if let Some(alpha) = &tile.alpha_animation {
                 let anim = &alpha.anim;
                 if visible {
-                    assert_eq!(anim.to(), 1., "visible tiles can animate alpha only to 1");
+                    // Focus-flash outbound animates a visible tile below 1, then restores via
+                    // `then`.
+                    if let AlphaAnimationKind::FocusFlash { then: Some(_) } = &alpha.kind {
+                        assert!(
+                            (0. ..=1.).contains(&anim.to()),
+                            "focus-flash target must be in 0..=1"
+                        );
+                        assert_ne!(anim.to(), 1., "focus-flash outbound target must not be 1");
+                    } else {
+                        assert_eq!(anim.to(), 1., "visible tiles can animate alpha only to 1");
+                    }
                 }
 
                 assert!(
-                    !alpha.hold_after_done,
+                    !alpha.hold_after_done(),
                     "tiles in the layout cannot have held alpha animation"
                 );
+
+                if let AlphaAnimationKind::FocusFlash { then } = &alpha.kind {
+                    if let Some((to, _)) = then {
+                        assert_eq!(*to, 1., "focus-flash then-phase must restore to 1");
+                    } else {
+                        assert_eq!(anim.to(), 1., "focus-flash restore phase must animate to 1");
+                    }
+                }
             }
         }
     }

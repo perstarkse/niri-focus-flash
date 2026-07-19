@@ -524,6 +524,30 @@ pub enum KeyboardFocus {
     Mru,
 }
 
+/// Whether focus-flash should run for this keyboard-focus transition.
+///
+/// Only direct `Layout` → `Layout` when the focused surface changes to a different `Some`
+/// surface (including `None` → `Some`). Overview/MRU/layer ↔ layout never flashes.
+pub(crate) fn should_focus_flash(prev: &KeyboardFocus, next: &KeyboardFocus) -> bool {
+    match (prev, next) {
+        (KeyboardFocus::Layout { surface: prev }, KeyboardFocus::Layout { surface: next }) => {
+            should_focus_flash_layout_surfaces(prev.as_ref(), next.as_ref())
+        }
+        _ => false,
+    }
+}
+
+/// Layout-surface flash predicate (generic so unit tests can use stand-in identities).
+pub(crate) fn should_focus_flash_layout_surfaces<S: PartialEq>(
+    prev: Option<&S>,
+    next: Option<&S>,
+) -> bool {
+    match next {
+        Some(next) => prev != Some(next),
+        None => false,
+    }
+}
+
 #[derive(Default, Clone, PartialEq)]
 pub struct PointContents {
     // Output under point.
@@ -1262,6 +1286,10 @@ impl State {
             );
 
             // Tell the windows their new focus state for window rule purposes.
+            // Focus-flash: only Layout → Layout with a different surface, and only when enabled.
+            let do_focus_flash = should_focus_flash(&self.niri.keyboard_focus, &focus)
+                && !self.niri.config.borrow().animations.focus_flash.anim.off;
+
             if let KeyboardFocus::Layout {
                 surface: Some(surface),
             } = &self.niri.keyboard_focus
@@ -1270,12 +1298,16 @@ impl State {
                     mapped.set_is_focused(false);
                 }
             }
+            let mut focus_flash_window = None;
             if let KeyboardFocus::Layout {
                 surface: Some(surface),
             } = &focus
             {
                 if let Some((mapped, _)) = self.niri.layout.find_window_and_output_mut(surface) {
                     mapped.set_is_focused(true);
+                    if do_focus_flash {
+                        focus_flash_window = Some(mapped.window.clone());
+                    }
 
                     // If `mapped` does not have a focus timestamp, then the window is newly
                     // created/mapped and a timestamp is unconditionally created.
@@ -1311,6 +1343,12 @@ impl State {
                         }
                     }
                 }
+            }
+            if let Some(window) = focus_flash_window {
+                self.niri.layout.animate_focus_flash(&window);
+            } else {
+                // Hard-clear any in-flight flash (leave-focus / non-flashing transition).
+                self.niri.layout.clear_focus_flashes();
             }
 
             if let Some(grab) = self.niri.popup_grab.as_mut() {
@@ -6539,5 +6577,76 @@ niri_render_elements! {
         Texture = PrimaryGpuTextureRenderElement,
         // Used for the CPU-rendered panels.
         RelocatedMemoryBuffer = RelocateRenderElement<MemoryRenderBufferRenderElement<R>>,
+    }
+}
+
+#[cfg(test)]
+mod focus_flash_trigger {
+    use super::{should_focus_flash, should_focus_flash_layout_surfaces, KeyboardFocus};
+
+    #[test]
+    fn layout_none_to_some_flashes() {
+        assert!(should_focus_flash_layout_surfaces::<u32>(None, Some(&1)));
+    }
+
+    #[test]
+    fn layout_a_to_b_flashes() {
+        assert!(should_focus_flash_layout_surfaces(Some(&1u32), Some(&2)));
+    }
+
+    #[test]
+    fn layout_same_surface_does_not_flash() {
+        assert!(!should_focus_flash_layout_surfaces(Some(&1u32), Some(&1)));
+    }
+
+    #[test]
+    fn layout_some_to_none_does_not_flash() {
+        assert!(!should_focus_flash_layout_surfaces(Some(&1u32), None));
+    }
+
+    #[test]
+    fn layout_to_no_surface_does_not_flash() {
+        assert!(!should_focus_flash(
+            &KeyboardFocus::Layout { surface: None },
+            &KeyboardFocus::Layout { surface: None },
+        ));
+    }
+
+    #[test]
+    fn non_layout_transitions_do_not_flash() {
+        // Overview/Mru/ScreenshotUi/etc. cover the non-Layout `_ => false` arm.
+        // LayerShell needs a live WlSurface to construct; it shares that arm.
+        assert!(!should_focus_flash(
+            &KeyboardFocus::Overview,
+            &KeyboardFocus::Layout { surface: None },
+        ));
+        assert!(!should_focus_flash(
+            &KeyboardFocus::Layout { surface: None },
+            &KeyboardFocus::Overview,
+        ));
+        assert!(!should_focus_flash(
+            &KeyboardFocus::Mru,
+            &KeyboardFocus::Layout { surface: None },
+        ));
+        assert!(!should_focus_flash(
+            &KeyboardFocus::ScreenshotUi,
+            &KeyboardFocus::Layout { surface: None },
+        ));
+        assert!(!should_focus_flash(
+            &KeyboardFocus::ExitConfirmDialog,
+            &KeyboardFocus::Layout { surface: None },
+        ));
+        assert!(!should_focus_flash(
+            &KeyboardFocus::Overview,
+            &KeyboardFocus::Mru,
+        ));
+        assert!(!should_focus_flash(
+            &KeyboardFocus::LockScreen { surface: None },
+            &KeyboardFocus::Layout { surface: None },
+        ));
+        assert!(!should_focus_flash(
+            &KeyboardFocus::Layout { surface: None },
+            &KeyboardFocus::LockScreen { surface: None },
+        ));
     }
 }

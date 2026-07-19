@@ -366,6 +366,12 @@ pub struct Layout<W: LayoutElement> {
     overview_progress: Option<OverviewProgress>,
     /// Configurable properties of the layout.
     options: Rc<Options>,
+    /// Exact "focus-flash currently active" flag.
+    ///
+    /// When `false`, [`Self::clear_focus_flashes`] skips the O(windows) scan. Cleared when the
+    /// flash chain drops in [`Self::advance_animations`]. May stay briefly true if another alpha
+    /// path steals the channel until the next advance syncs it.
+    focus_flash_in_flight: bool,
 }
 
 #[derive(Debug)]
@@ -704,6 +710,7 @@ impl<W: LayoutElement> Layout<W> {
             overview_open: false,
             overview_progress: None,
             options: Rc::new(options),
+            focus_flash_in_flight: false,
         }
     }
 
@@ -729,6 +736,7 @@ impl<W: LayoutElement> Layout<W> {
             overview_open: false,
             overview_progress: None,
             options: opts,
+            focus_flash_in_flight: false,
         }
     }
 
@@ -1545,6 +1553,136 @@ impl<W: LayoutElement> Layout<W> {
                 }
             }
         }
+    }
+
+    /// Flash the window's opacity on focus, then restore (if configured).
+    ///
+    /// Hard-clears any in-flight focus-flash on other tiles first (no concurrent offscreens).
+    pub fn animate_focus_flash(&mut self, window: &W::Id) {
+        let conf = &self.options.animations.focus_flash;
+        // Config reload / `off` mid-flash must still hard-clear via the seat path.
+        if conf.anim.off {
+            self.clear_focus_flashes();
+            return;
+        }
+        let target = conf.min_opacity;
+        let config = conf.anim;
+
+        if !self.has_window(window) {
+            self.clear_focus_flashes();
+            return;
+        }
+
+        self.clear_focus_flashes_except(Some(window));
+
+        if let Some(InteractiveMoveState::Moving(move_)) = &mut self.interactive_move {
+            if move_.tile.window().id() == window {
+                move_.tile.animate_focus_flash(target, config);
+                let in_flight = move_
+                    .tile
+                    .alpha_animation
+                    .as_ref()
+                    .is_some_and(|a| a.is_focus_flash());
+                self.focus_flash_in_flight = in_flight;
+                return;
+            }
+        }
+
+        let in_flight = {
+            let mut started = false;
+            for ws in self.workspaces_mut() {
+                if let Some(tile) = ws.tiles_mut().find(|tile| tile.window().id() == window) {
+                    tile.animate_focus_flash(target, config);
+                    started = tile
+                        .alpha_animation
+                        .as_ref()
+                        .is_some_and(|a| a.is_focus_flash());
+                    break;
+                }
+            }
+            started
+        };
+        self.focus_flash_in_flight = in_flight;
+    }
+
+    /// Hard-clear focus-flash on every tile except optionally `except`.
+    ///
+    /// Leave-focus snaps to opaque so rapid A→B→C does not leave N offscreen restores.
+    /// Still clears if config was reloaded to `off` mid-flash.
+    pub fn clear_focus_flashes_except(&mut self, except: Option<&W::Id>) {
+        if !self.focus_flash_in_flight {
+            return;
+        }
+
+        if let Some(InteractiveMoveState::Moving(move_)) = &mut self.interactive_move {
+            if except.is_none_or(|id| move_.tile.window().id() != id) {
+                move_.tile.clear_focus_flash();
+            }
+        }
+
+        for ws in self.workspaces_mut() {
+            for tile in ws.tiles_mut() {
+                if except.is_none_or(|id| tile.window().id() != id) {
+                    tile.clear_focus_flash();
+                }
+            }
+        }
+
+        self.focus_flash_in_flight = match except {
+            Some(id) => self.window_has_focus_flash(id),
+            None => false,
+        };
+    }
+
+    /// Hard-clear every in-flight focus-flash (drop offscreen immediately).
+    ///
+    /// Used when leaving layout focus (layer/overview/MRU/etc.) and when not starting a new
+    /// flash. Still clears if config was reloaded to `off` mid-flash.
+    pub fn clear_focus_flashes(&mut self) {
+        self.clear_focus_flashes_except(None);
+    }
+
+    fn window_has_focus_flash(&self, id: &W::Id) -> bool {
+        if let Some(InteractiveMoveState::Moving(move_)) = &self.interactive_move {
+            if move_.tile.window().id() == id {
+                return move_
+                    .tile
+                    .alpha_animation
+                    .as_ref()
+                    .is_some_and(|a| a.is_focus_flash());
+            }
+        }
+
+        self.workspaces().any(|(_, _, ws)| {
+            ws.tiles().any(|tile| {
+                tile.window().id() == id
+                    && tile
+                        .alpha_animation
+                        .as_ref()
+                        .is_some_and(|a| a.is_focus_flash())
+            })
+        })
+    }
+
+    fn any_focus_flash(&self) -> bool {
+        if let Some(InteractiveMoveState::Moving(move_)) = &self.interactive_move {
+            if move_
+                .tile
+                .alpha_animation
+                .as_ref()
+                .is_some_and(|alpha| alpha.is_focus_flash())
+            {
+                return true;
+            }
+        }
+
+        self.workspaces().any(|(_, _, ws)| {
+            ws.tiles().any(|tile| {
+                tile.alpha_animation
+                    .as_ref()
+                    .is_some_and(|a| a.is_focus_flash())
+            })
+        })
     }
 
     pub fn activate_window_without_raising(&mut self, window: &W::Id) {
@@ -2373,6 +2511,15 @@ impl<W: LayoutElement> Layout<W> {
 
         use approx::assert_abs_diff_eq;
 
+        // Never false while a flash is active. May stay briefly true after another alpha path
+        // steals the channel until the next [`Self::advance_animations`] syncs it.
+        if !self.focus_flash_in_flight {
+            assert!(
+                !self.any_focus_flash(),
+                "focus_flash_in_flight false while a focus-flash is active"
+            );
+        }
+
         let zoom = self.overview_zoom();
 
         let mut move_win_id = None;
@@ -2422,7 +2569,7 @@ impl<W: LayoutElement> Layout<W> {
                             );
 
                             assert!(
-                                !alpha.hold_after_done,
+                                !alpha.hold_after_done(),
                                 "interactively moved floating tile \
                                  cannot have held alpha animation"
                             );
@@ -2434,7 +2581,7 @@ impl<W: LayoutElement> Layout<W> {
                             );
 
                             assert!(
-                                alpha.hold_after_done,
+                                alpha.hold_after_done(),
                                 "interactively moved scrolling tile \
                                  must have held alpha animation"
                             );
@@ -2722,6 +2869,10 @@ impl<W: LayoutElement> Layout<W> {
                 }
             }
         }
+
+        if self.focus_flash_in_flight && !self.any_focus_flash() {
+            self.focus_flash_in_flight = false;
+        }
     }
 
     pub fn are_animations_ongoing(&self, output: Option<&Output>) -> bool {
@@ -2958,6 +3109,9 @@ impl<W: LayoutElement> Layout<W> {
     }
 
     fn update_options(&mut self, options: Options) {
+        let turning_off = !self.options.animations.focus_flash.anim.off
+            && options.animations.focus_flash.anim.off;
+
         let options = Rc::new(options);
 
         if let Some(InteractiveMoveState::Moving(move_)) = &mut self.interactive_move {
@@ -2984,6 +3138,11 @@ impl<W: LayoutElement> Layout<W> {
         }
 
         self.options = options;
+
+        // Config reload to off must drop an in-flight flash immediately (no focus event required).
+        if turning_off {
+            self.clear_focus_flashes();
+        }
     }
 
     pub fn toggle_width(&mut self, forwards: bool) {

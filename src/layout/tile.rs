@@ -94,6 +94,9 @@ pub struct Tile<W: LayoutElement> {
     move_y_animation: Option<MoveAnimation>,
 
     /// The animation of the tile's opacity.
+    ///
+    /// Focus-flash is a two-phase chain on this same channel (`then` restore to 1), not a
+    /// parallel opacity pipeline.
     pub(super) alpha_animation: Option<AlphaAnimation>,
 
     /// Offset during the initial interactive move rubberband.
@@ -165,13 +168,64 @@ struct MoveAnimation {
 #[derive(Debug)]
 pub(super) struct AlphaAnimation {
     pub(super) anim: Animation,
-    /// Whether the animation should persist after it's done.
-    ///
-    /// This is used by things like interactive move which need to animate alpha to
-    /// semitransparent, then hold it at semitransparent for a while, until the operation
-    /// completes.
-    pub(super) hold_after_done: bool,
+    pub(super) kind: AlphaAnimationKind,
     offscreen: OffscreenBuffer,
+}
+
+/// Purpose of an [`AlphaAnimation`] — keeps fade vs focus-flash states disjoint.
+#[derive(Debug)]
+pub(super) enum AlphaAnimationKind {
+    /// Fade to a target; optionally hold after done (interactive move).
+    Fade { hold_after_done: bool },
+    /// Focus-flash: outbound, then optional restore (`then` cleared when consumed).
+    FocusFlash {
+        /// After the current animation completes, start another to this value with this config.
+        ///
+        /// Outbound goes to the minimum opacity; restore goes to 1. Cleared when consumed.
+        /// Under `should_complete_instantly`, both phases finish in one advance (no restore
+        /// started).
+        then: Option<(f64, niri_config::Animation)>,
+    },
+}
+
+impl AlphaAnimation {
+    pub(super) fn is_focus_flash(&self) -> bool {
+        matches!(self.kind, AlphaAnimationKind::FocusFlash { .. })
+    }
+
+    #[cfg(test)]
+    pub(super) fn hold_after_done(&self) -> bool {
+        matches!(
+            self.kind,
+            AlphaAnimationKind::Fade {
+                hold_after_done: true
+            }
+        )
+    }
+
+    pub(super) fn focus_flash_then(&self) -> Option<&(f64, niri_config::Animation)> {
+        match &self.kind {
+            AlphaAnimationKind::FocusFlash { then } => then.as_ref(),
+            AlphaAnimationKind::Fade { .. } => None,
+        }
+    }
+}
+
+/// Split total focus-flash duration evenly across outbound and restore phases.
+///
+/// Returns `None` for spring so callers can no-op instead of panicking. Config parse already
+/// rejects spring; this covers programmatic/`update_options` paths.
+fn focus_flash_phase_config(config: niri_config::Animation) -> Option<niri_config::Animation> {
+    let niri_config::animations::Kind::Easing(p) = config.kind else {
+        return None;
+    };
+    Some(niri_config::Animation {
+        off: config.off,
+        kind: niri_config::animations::Kind::Easing(niri_config::animations::EasingParams {
+            duration_ms: p.duration_ms / 2,
+            curve: p.curve,
+        }),
+    })
 }
 
 impl<W: LayoutElement> Tile<W> {
@@ -434,9 +488,31 @@ impl<W: LayoutElement> Tile<W> {
             }
         }
 
-        if let Some(alpha) = &mut self.alpha_animation {
-            if !alpha.hold_after_done && alpha.anim.is_done() {
-                self.alpha_animation = None;
+        if let Some(mut alpha) = self.alpha_animation.take() {
+            if alpha.anim.is_done() {
+                match &mut alpha.kind {
+                    AlphaAnimationKind::FocusFlash { then } => {
+                        if let Some((to, config)) = then.take() {
+                            // CompleteAnimations / instant clock: finish the whole chain in one
+                            // advance.
+                            if !self.clock.should_complete_instantly() {
+                                let from = alpha.anim.to();
+                                self.alpha_animation = Some(AlphaAnimation {
+                                    anim: Animation::new(self.clock.clone(), from, to, 0., config),
+                                    kind: AlphaAnimationKind::FocusFlash { then: None },
+                                    offscreen: alpha.offscreen,
+                                });
+                            }
+                        }
+                    }
+                    AlphaAnimationKind::Fade { hold_after_done } => {
+                        if *hold_after_done {
+                            self.alpha_animation = Some(alpha);
+                        }
+                    }
+                }
+            } else {
+                self.alpha_animation = Some(alpha);
             }
         }
     }
@@ -453,7 +529,7 @@ impl<W: LayoutElement> Tile<W> {
             || self
                 .alpha_animation
                 .as_ref()
-                .is_some_and(|alpha| !alpha.anim.is_done())
+                .is_some_and(|alpha| !alpha.anim.is_done() || alpha.focus_flash_then().is_some())
     }
 
     pub fn update_render_elements(&mut self, is_active: bool, view_rect: Rectangle<f64, Logical>) {
@@ -643,24 +719,89 @@ impl<W: LayoutElement> Tile<W> {
 
         self.alpha_animation = Some(AlphaAnimation {
             anim: Animation::new(self.clock.clone(), current, to, 0., config),
-            hold_after_done: false,
+            kind: AlphaAnimationKind::Fade {
+                hold_after_done: false,
+            },
             offscreen,
         });
     }
 
+    /// Flash opacity to `target` then restore to fully opaque (chained on `alpha_animation`).
+    ///
+    /// `config` duration is the **total** flash time; each phase uses half (`duration_ms / 2`).
+    /// No-op when off, spring, completing instantly, opening, or a non-flash alpha is in progress.
+    /// Restarts if a focus-flash is already running.
+    pub fn animate_focus_flash(&mut self, target: f64, config: niri_config::Animation) {
+        if config.off || self.clock.should_complete_instantly() || self.open_animation.is_some() {
+            return;
+        }
+
+        let Some(phase) = focus_flash_phase_config(config) else {
+            return;
+        };
+
+        if self
+            .alpha_animation
+            .as_ref()
+            .is_some_and(|alpha| !alpha.is_focus_flash())
+        {
+            return;
+        }
+
+        let target = target.clamp(0., 1.);
+        if (target - 1.).abs() < 1e-6 {
+            return;
+        }
+
+        let (from, offscreen) = if let Some(alpha) = self.alpha_animation.take() {
+            (alpha.anim.clamped_value(), alpha.offscreen)
+        } else {
+            (1., OffscreenBuffer::default())
+        };
+
+        self.alpha_animation = Some(AlphaAnimation {
+            anim: Animation::new(self.clock.clone(), from, target, 0., phase),
+            kind: AlphaAnimationKind::FocusFlash {
+                then: Some((1., phase)),
+            },
+            offscreen,
+        });
+    }
+
+    /// Drop an in-flight focus-flash immediately (no restore animation).
+    pub fn clear_focus_flash(&mut self) {
+        if self
+            .alpha_animation
+            .as_ref()
+            .is_some_and(|alpha| alpha.is_focus_flash())
+        {
+            self.alpha_animation = None;
+        }
+    }
+
     pub fn ensure_alpha_animates_to_1(&mut self) {
-        if let Some(alpha) = &self.alpha_animation {
-            if alpha.anim.to() != 1. {
-                // Cancel animation instead of starting a new one because the user likely wants to
-                // see the tile right away.
-                self.alpha_animation = None;
-            }
+        let Some(alpha) = &self.alpha_animation else {
+            return;
+        };
+
+        if alpha.is_focus_flash() {
+            // Hard-clear: tab fade callers want the tile visible right away.
+            self.clear_focus_flash();
+            return;
+        }
+
+        if alpha.anim.to() != 1. {
+            // Cancel animation instead of starting a new one because the user likely wants to
+            // see the tile right away.
+            self.alpha_animation = None;
         }
     }
 
     pub fn hold_alpha_animation_after_done(&mut self) {
         if let Some(alpha) = &mut self.alpha_animation {
-            alpha.hold_after_done = true;
+            if let AlphaAnimationKind::Fade { hold_after_done } = &mut alpha.kind {
+                *hold_after_done = true;
+            }
         }
     }
 
@@ -1329,7 +1470,8 @@ impl<W: LayoutElement> Tile<W> {
         let tile_alpha = self
             .alpha_animation
             .as_ref()
-            .map_or(1., |alpha| alpha.anim.clamped_value()) as f32;
+            .map(|alpha| alpha.anim.clamped_value())
+            .unwrap_or(1.) as f32;
 
         let mut pushed = false;
         self.window().set_offscreen_data(None);
@@ -1361,7 +1503,8 @@ impl<W: LayoutElement> Tile<W> {
                     warn!("error rendering window opening animation: {err:?}");
                 }
             }
-        } else if let Some(alpha) = &self.alpha_animation {
+        } else if let Some(offscreen) = self.alpha_animation.as_ref().map(|alpha| &alpha.offscreen)
+        {
             let mut ctx = ctx.as_gles();
             let mut elements = Vec::new();
             self.render_inner(
@@ -1371,7 +1514,7 @@ impl<W: LayoutElement> Tile<W> {
                 focus_ring,
                 &mut |elem| elements.push(elem),
             );
-            match alpha.offscreen.render(ctx.renderer, scale, &elements) {
+            match offscreen.render(ctx.renderer, scale, &elements) {
                 Ok((elem, _sync, data)) => {
                     let offset = elem.offset();
                     let elem = elem.with_alpha(tile_alpha).with_offset(location + offset);

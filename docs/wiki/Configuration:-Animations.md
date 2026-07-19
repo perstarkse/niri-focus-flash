@@ -62,6 +62,13 @@ animations {
     recent-windows-close {
         spring damping-ratio=1.0 stiffness=800 epsilon=0.001
     }
+
+    // Off by default; uncomment to flash opacity on window focus.
+    // focus-flash {
+    //     min-opacity 0.75
+    //     duration-ms 150
+    //     curve "ease-out-quad"
+    // }
 }
 ```
 
@@ -436,6 +443,36 @@ The close fade-out animation of the recent windows switcher.
 animations {
     recent-windows-close {
         spring damping-ratio=1.0 stiffness=800 epsilon=0.001
+    }
+}
+```
+
+#### `focus-flash`
+
+<sup>Since: 26.04</sup>
+
+Flash the focused window's opacity, then restore it.
+
+This is an opt-in complement to the focus ring: a short opacity pulse on the newly focused window. It is **off by default**. Writing a `focus-flash { }` block enables it (unless the block contains `off`).
+
+`min-opacity` is the lowest opacity during the flash (from 0.0 to 1.0): the window animates from fully opaque down to this value, then back to fully opaque. It is applied as an extra tile alpha on top of any window-rule opacity (the two multiply).
+
+`duration-ms` is the **total** flash time (outbound + restore); each phase uses half (`duration-ms / 2`, floored). Prefer an even value of at least 2. The same curve is used for both phases. Use easing (`duration-ms` / `curve`); `spring` is not supported for this animation.
+
+The flash reuses the tile alpha channel and its offscreen composite (same path as tabbed fade / interactive-move alpha). Prefer a short duration: with this enabled, each flashing focus change pays an offscreen round-trip. Leave it off if you do not want that cost on routine navigation.
+
+It triggers only on **direct layout→layout** keyboard focus changes when the focused surface changes to a different window (including the first focused window after empty layout focus, e.g. `None` → a window). Focus that arrives via overview, MRU, or layer shell in one seat update does **not** flash, even if the layout window underneath changed. Returning from those modes to layout is always silent under this predicate.
+
+Leave-focus **hard-clears** an in-flight flash (snap to opaque): switching A→B, and leaving layout entirely (layer/overview/MRU/etc.). Reloading config to `off` (or removing the `focus-flash` block) also hard-clears any in-flight flash immediately.
+
+If the window open animation is still running, focus-flash is skipped for that tile (a known tradeoff: the first focus on a newly opened window often has no flash). Once open finishes, a later layout→layout focus change can flash.
+
+```kdl
+animations {
+    focus-flash {
+        min-opacity 0.75
+        duration-ms 150
+        curve "ease-out-quad"
     }
 }
 ```

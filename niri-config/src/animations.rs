@@ -19,6 +19,7 @@ pub struct Animations {
     pub screenshot_ui_open: ScreenshotUiOpenAnim,
     pub overview_open_close: OverviewOpenCloseAnim,
     pub recent_windows_close: RecentWindowsCloseAnim,
+    pub focus_flash: FocusFlashAnim,
 }
 
 impl Default for Animations {
@@ -37,6 +38,7 @@ impl Default for Animations {
             screenshot_ui_open: Default::default(),
             overview_open_close: Default::default(),
             recent_windows_close: Default::default(),
+            focus_flash: Default::default(),
         }
     }
 }
@@ -71,6 +73,8 @@ pub struct AnimationsPart {
     pub overview_open_close: Option<OverviewOpenCloseAnim>,
     #[knuffel(child)]
     pub recent_windows_close: Option<RecentWindowsCloseAnim>,
+    #[knuffel(child)]
+    pub focus_flash: Option<FocusFlashAnim>,
 }
 
 impl MergeWith<AnimationsPart> for Animations {
@@ -97,6 +101,7 @@ impl MergeWith<AnimationsPart> for Animations {
             screenshot_ui_open,
             overview_open_close,
             recent_windows_close,
+            focus_flash,
         );
     }
 }
@@ -326,6 +331,36 @@ impl Default for RecentWindowsCloseAnim {
     }
 }
 
+/// Flash window opacity on focus, then restore.
+///
+/// Off by default. Writing a `focus-flash { }` block enables it (unless it contains `off`).
+/// Easing only — `spring` is rejected (two-phase spring down/up feels wrong).
+/// `duration-ms` is the **total** flash time (outbound + restore); each phase uses half
+/// (`duration_ms / 2`, floored). Prefer an even value of at least 2.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct FocusFlashAnim {
+    pub anim: Animation,
+    /// Minimum opacity during the flash (0.0–1.0): fully opaque → this → fully opaque.
+    /// Applied as tile alpha on top of window-rule opacity.
+    pub min_opacity: f64,
+}
+
+impl Default for FocusFlashAnim {
+    fn default() -> Self {
+        Self {
+            // Disabled until the user adds a `focus-flash` block.
+            anim: Animation {
+                off: true,
+                kind: Kind::Easing(EasingParams {
+                    duration_ms: 150,
+                    curve: Curve::EaseOutQuad,
+                }),
+            },
+            min_opacity: 0.75,
+        }
+    }
+}
+
 impl<S> knuffel::Decode<S> for WorkspaceSwitchAnim
 where
     S: knuffel::traits::ErrorSpan,
@@ -521,6 +556,47 @@ where
         Ok(Self(Animation::decode_node(node, ctx, default, |_, _| {
             Ok(false)
         })?))
+    }
+}
+
+impl<S> knuffel::Decode<S> for FocusFlashAnim
+where
+    S: knuffel::traits::ErrorSpan,
+{
+    fn decode_node(
+        node: &knuffel::ast::SpannedNode<S>,
+        ctx: &mut knuffel::decode::Context<S>,
+    ) -> Result<Self, DecodeError<S>> {
+        // Presence of the block enables the animation; start from an on default.
+        let default = Animation {
+            off: false,
+            kind: Kind::Easing(EasingParams {
+                duration_ms: 150,
+                curve: Curve::EaseOutQuad,
+            }),
+        };
+        let mut min_opacity = None;
+        let anim = Animation::decode_node(node, ctx, default, |child, ctx| {
+            if &**child.node_name == "min-opacity" {
+                let value: FloatOrInt<0, 1> = parse_arg_node("min-opacity", child, ctx)?;
+                min_opacity = Some(value.0);
+                Ok(true)
+            } else {
+                Ok(false)
+            }
+        })?;
+
+        if matches!(anim.kind, Kind::Spring(_)) {
+            ctx.emit_error(DecodeError::conversion(
+                node,
+                "focus-flash does not support spring; use duration-ms and curve",
+            ));
+        }
+
+        Ok(Self {
+            anim,
+            min_opacity: min_opacity.unwrap_or(Self::default().min_opacity),
+        })
     }
 }
 
